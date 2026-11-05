@@ -1,0 +1,352 @@
+# Agent Plan v2: RustingStrata + Qwen3.8-Flash-Next on Kaggle 2× T4 (source-verified)
+
+**You are an agent running inside a Kaggle notebook kernel.** Scope: **one engine**, RustingStrata
+(github.com/RustingStudio/RustingStrata, analysed at commit `37ba980`, v1.1.0), and **one model**,
+Qwen3.8-Flash-Next. No other engines. The only other model allowed is a tiny smoke file for kernel
+checks. The plan has two goals:
+1. Make it run correctly on Turing (it does not as shipped; see §1).
+2. Get the most out of **both** T4s: single-GPU tuning first, then a second-GPU expert tier (§6).
+
+Everything in §1 was verified offline by reading the source and compiling `kernels.cu` with NVRTC 13
+for sm_75 and sm_86. It was **not** run on a GPU. Every fix must pass the repo's own GPU tests on the
+T4 before any benchmark.
+
+---
+
+## 1. What the source analysis found (facts, with file references)
+
+**Architecture**
+- Pure Rust. CUDA kernels live in one file, `src/cuda/kernels.cu` (~2,100 lines). They are compiled
+  at run time by NVRTC for `sm_{major}{minor}` of the device (`src/cuda/mod.rs::Gpu::new`: arch from
+  `compute_capability()`, not hard-coded). The cubin is cached in `$XDG_CACHE_HOME/rusting_strata/`.
+- The GGUF is **memory-mapped** (`src/gguf.rs`, memmap2): RAM use is mostly reclaimable page cache.
+  `weights.rs` uses `MADV_WILLNEED` prefetch and `MADV_COLD` for experts already on the GPU.
+- **Decode:** dense weights live on the GPU. Routed experts fill VRAM slots (`expert_cache.rs`)
+  hottest-first, from a saved routing profile (`~/.cache/rusting_strata/profile-qwen4exp-48x512-1224.f32`).
+  Hot/cold swaps (`adapt`) happen while it runs. **Missed experts are computed on the CPU**
+  (`cpu_worker.rs` + `cpu_moe.rs`, AVX2 kernels for IQ2_XS, IQ2_XXS, IQ2_S, IQ1_S, IQ1_M, Q2_K,
+  Q3_K, Q2_0, Q4_K, IQ3_XXS, IQ3_S, IQ4_XS). The GPU writes routing ids and the activation into a
+  pinned, host-mapped mailbox (`CU_MEMHOSTALLOC_DEVICEMAP | PORTABLE`). A **spinning** worker thread
+  plus a rayon pool computes them, and the GPU combine kernel waits on a flag (`__nanosleep`).
+- **Prefill:** missed experts are **staged over PCIe** to the GPU in groups (`gpu_model/prefill.rs`)
+  and run as GEMMs there, with copies overlapped with resident-expert GEMMs.
+- The PLE / N-gram table (`per_layer_token_embd`, shard 2) stays on the CPU and is read through
+  mmap.
+- **Flash-Next config** (from `tests/gguf.rs`): 48 layers (attention every 4th), n_embd 2560, 24 heads,
+  **2 KV heads, head_dim 256**, 512 experts, 10 used, expert FFN 640, shared FFN 640, hc_n 4,
+  PLE width 160, and 1,224 tensors over both shards.
+- **Single GPU only:** `--device N` (default 0), one `Box<dyn Backend>`, one `ExpertCache`, one
+  `CpuWorker`. No multi-GPU code exists.
+- The server handles one request at a time. It reuses the previous request's prefill when the new
+  one extends it, and since commit `2a39236` it also keeps the state after the system prompt and
+  tools, so a compacted conversation restarts from there. Tool calls go through `src/chat.rs`
+  (Qwen3.6 XML and Qwen3/Next JSON formats).
+- **Useful tools built in:** `strata bench`, `strata calibrate` (writes the prefill chunk, MTP drafts
+  and threads to a calibration file), `strata perplexity --kld-base` (llama-perplexity compatible),
+  `strata score`, `strata info`. The `.cargo/config.toml` sets `-C target-cpu=native`.
+
+**Turing blockers (verified by compiling for sm_75)**
+
+| # | Where | Problem on T4 | Fix |
+|---|---|---|---|
+| T1 | `kernels.cu` `topk_warp` | `__reduce_max_sync` / `__reduce_min_sync` are sm_80+ (NVRTC front-end error: the shipped code does not compile for sm_75) | shuffle reductions under `#if __CUDA_ARCH__ < 800` |
+| T2 | `cp_async16/8`, commit/wait | `cp.async` is sm_80+ (used by attention decode with f16 KV, attention prefill, `gemmi`) | synchronous copy fallback (zero-fill when `!ok`); existing barriers keep ordering |
+| T3 | `mma16816` (f16) | `mma.m16n8k16` f16 is sm_80+ (gemm_f, attention prefill) | 2× `mma.m16n8k8` (sm_75) |
+| T4 | `mma_s8_16816/16832` | int8 `m16n8k16/k32` are sm_80+ (`gemmi`, the int8 prefill GEMMs) | 2× / 4× `mma.m8n8k16.s8` (sm_72+) |
+| T5 | `attn_prefill_t` | tile (64 + 2·32)·(256 + 8)·2 B = **67,584 B** of shared memory > Turing's 64 KB | `FA_BK 16` on sm_75 → 50,688 B (**host must match**, H2) |
+| H1 | `cuda/mod.rs` `Gpu::new` | sets `MAX_DYNAMIC_SHARED_SIZE_BYTES = 96 KB` on attention/gemvn kernels; sm_75's opt-in maximum is 64 KB, so this likely errors at start-up | clamp to the device's `MAX_SHARED_MEMORY_PER_BLOCK_OPTIN` |
+| H2 | `cuda/mod.rs` `attn_prefill` | `smem = 2*(64+32+32)*(hd+8)` is hard-coded for `FA_BK = 32` | use `FA_BK = 16` when compute capability < 8 |
+| H3 | `cuda/mod.rs` `attn` | `attn_decode_gqa_256` with the **f16** KV cache asks for 8·256·4 + 65,536 = **73,728 B** | always run with **`--kv q8`** on T4 (the cp chunk term is 0; it also halves KV memory) |
+
+**Patch status:** `patches/kernels-sm75.diff` (T1–T5; generated by `patches/make_sm75.py`) applies
+cleanly with `git apply` at `37ba980`. With it, `kernels.cu` compiles for sm_75 with
+`KV_Q8=0` and `KV_Q8=1` (NVRTC 13). Every change is under `#if __CUDA_ARCH__ < 800`, so the sm_80+
+build is unchanged.
+
+**Host patches H1 and H2 are not written yet** (Rust; it could not be built offline). Write them in
+Phase 1; they are a few lines each.
+
+**Unknowns that only a T4 run can settle:**
+- whether the mma fragment re-mapping in T3/T4 is numerically right (the repo's kernel tests decide);
+- whether cudarc's `cuda-13010` feature (CUDA 13.1 API) loads against Kaggle's driver 580 (CUDA 13.0);
+- real speed.
+
+---
+
+## 2. Performance model (estimates to verify; they decide what to build)
+
+Per token Flash-Next routes 10 × 48 = **480 experts** of ≈ 4.9 M parameters each. At IQ2_XS
+(2.31 bpw) that is ≈ 1.42 MB per expert and **≈ 0.68 GB per token**; all experts together ≈ 35 GB.
+Dense per-token reads (attention, DeltaNet, shared experts, head) are about 1.5–2 GB on the GPU.
+
+**Author's box (3060 12 GB):** 18% of experts resident, 22 tok/s; misses are computed by a 6-core Zen 4
+CPU on DDR5.
+
+**Kaggle, 1× T4 (14.5 GB):** after dense weights, KV (q8) and prefill scratch, roughly 9–10 GB of
+experts fit, ≈ 26–28% of them. The CPU lane is 2 cores on ~7.5 GB/s RAM, so expect **~6–12 tok/s**.
+
+**Kaggle, 2× T4 with GPU 1 as an expert tier (§6):** GPU 1 has no dense weights, so ~13.5 GB of
+experts fit there. Together that's ~23 GB, **≈ 65% of all experts** resident, and with routing skew
+probably 85–95% of *routed hits*. GPU 1 computes its share in parallel with the CPU's (smaller) share.
+Rough estimate: **~25–40 tok/s**. Per-layer overhead is about 10 KB of activation in and 10 KB of
+result out through the already-portable host mailbox. This is the main lever on this machine.
+
+**Two independent instances (no code):** two users at single-GPU speed each, sharing the mmap
+page cache. It does not speed up a single stream.
+
+The single-GPU measurements in Phase 3 (hit rate, CPU busy time per token, GPU time per token) must
+confirm or kill the 2× estimate before Phase 5 starts.
+
+---
+
+## 3. Ground rules (lessons from earlier runs; mandatory)
+
+1. Persist after every measurement: `state.json`, append to `results.jsonl`, `NOTES.md`; then sync
+   (§4). Resume from state; steps are idempotent.
+2. Every model process runs through the guard (§5).
+3. **Nothing heavy beside a running model** (no cargo build, tar, zstd or big download).
+4. **Never `pkill -f`.** Stop processes by recorded PID or by exact `/proc/<pid>/cmdline` match.
+5. **The binary is called `strata`.** Use the absolute path `$RS=$SCRATCH/rustingstrata/target/release/strata`.
+6. Weights live in `$SCRATCH=/root/scratch`, never in `/kaggle/working`.
+7. **Always `--kv q8` on T4** (H3). Always `--gpu`. Always `--backend cuda` (no Vulkan on Kaggle,
+   unless Phase 1 finds an NVIDIA ICD).
+8. One variable at a time; record command, commit, applied patches (by hash), env and file.
+9. Reserve 30 min at the end for the report and the final sync.
+10. **Licence (RustingStrata License 1.0):** modifying is allowed. Keep the patches as diffs under
+    `$OUT/patches/` with a description. Any redistribution must keep the licence, describe the
+    modifications and credit "Uses RustingStrata by Vasyl Trefilov". Do not sell the engine itself.
+
+---
+
+## 4. Persistence and sync
+
+- `$OUT=/kaggle/working/agent/rustingstrata/` with `state.json`, `results.jsonl`, `NOTES.md`,
+  `REPORT.md`, `logs/`, `telemetry/`, `patches/`, `bin/`, `scripts/`.
+- **Input files from the user** (put them in `$OUT/patches/` before starting): `kernels-sm75.diff`,
+  `make_sm75.py`, `nvrtc_check.py`. If they are missing, regenerate the diff by hand from §1 T1–T5.
+- **Fix remote sync first.** Attach the `HF_TOKEN` secret *to this notebook* (Add-ons → Secrets →
+  toggle on for this notebook). Fallback: a Kaggle Dataset via the `kaggle` CLI. Last resort: keep
+  `/kaggle/working` current for "Save Version".
+- Sync after every step, every 3 sweep points, every 15 min, and on SIGTERM. Never sync weights.
+- Archive the built binary and the cubin cache directory to `bin/` once they work, with no model
+  running.
+- **Gate 0:** one successful sync (or the documented fallback).
+
+---
+
+## 5. Guard
+- **RAM:** kill above **28.0 GiB of non-reclaimable memory** (`anon + kernel + sock + shmem` from
+  `/sys/fs/cgroup/memory.stat`; not `memory.current`, which page cache inflates). Record pinned and
+  locked memory. Evict model pages with `posix_fadvise(DONTNEED)` before cold measurements.
+- **OOM priority:** child `oom_score_adj=1000`, own process group.
+- **Timeouts:** cargo build 25 min, tests 20 min, load 15 min, bench 15 min; `too_slow` below
+  0.5 tok/s for 3 min.
+- **1 Hz telemetry:** VRAM and util per GPU, memory figures, child disk `read_bytes`, CPU% per core.
+- Also parse the engine's own report line: `expert hit rate X% (N misses), cache swaps M` and its
+  CPU worker busy time.
+
+---
+
+## 6. The second-GPU design (to be built in Phase 5)
+
+**Goal:** GPU 1 becomes a second VRAM expert tier and a second expert-compute lane. Experts are
+placed hottest on GPU 0, next hottest on GPU 1, the rest on the CPU.
+
+**Why this design and not the alternatives:**
+- **Layer split (pipeline):** both GPUs must hold dense weights, and they work one after the other,
+  so there is less expert room and no overlap. It is also a large refactor of `GpuModel` and its
+  CUDA graphs.
+- **Tensor parallel:** two all-reduces per layer × 48 layers over PCIe without P2P. Too slow for
+  single-token decode.
+- **Expert tier:** reuses the existing mailbox protocol and the same `moe_gemv_*` kernels, and
+  GPU 1 holds only experts. It is the smallest change for the largest residency gain.
+
+**Decode path changes:**
+1. **Second backend:** open `crate::cuda::Gpu::new(1)` (new flag `--expert-gpu 1`). Build an
+   `ExpertCache` on it with a budget of free VRAM minus `--vram-margin`, filled with the next-hottest
+   experts by the same routing profile, **excluding** those resident on GPU 0.
+2. **`CpuWorker` loop:** when a layer request arrives, split the missed ids into
+   (a) resident on GPU 1 and (b) CPU.
+   - For (a), launch on GPU 1's stream the existing `moe_gemv_<type>` (or batched) kernels. Use the
+     mailbox activation **through its device-mapped address in GPU 1's context**: it is PORTABLE;
+     get the pointer via `cuMemHostGetDevicePointer` in that context. Write the weighted sum into a
+     small per-layer pinned result buffer.
+   - Compute (b) on the CPU as now.
+   - Wait on GPU 1's event (spin with a timeout), add the two sums, write the result, raise DONE.
+     The GPU 0 side is unchanged.
+3. **Adaptation:** extend `adapt` to three tiers (GPU 0 ↔ GPU 1 ↔ CPU) with the same decayed counts.
+   Swaps on GPU 1 upload from the mmapped weights on GPU 1's stream.
+4. **Threads:** GPU 1 launches happen on the worker thread, so the CPU lane loses no core. Re-tune
+   `--threads` afterwards (2, 3, 4).
+
+**Prefill path (Phase 6, optional):** for experts resident on GPU 1, copy the gathered activation
+rows (≈ 10 KB per token per layer) to GPU 1, run the existing GEMM tiles there, and copy the results
+back, instead of staging those experts' weights (≈ 1.4 MB each) to GPU 0. Only worth doing if Phase 5
+works and long-prompt TTFT is still the bottleneck.
+
+**Correctness gates:**
+- Greedy output on 20 fixed prompts is identical, or differs only at near-ties, against the
+  single-GPU run. Measure top-1 agreement with `strata score`. Expect small numeric differences,
+  because GPU 1 uses int8 activations where the CPU lane uses q8_K.
+- `strata perplexity` (20 chunks × 512) within 0.5% of the single-GPU value.
+- No hang over 2,000 tokens. The worker must time out and fall back to the CPU for GPU 1's share if
+  GPU 1 stalls.
+
+---
+
+## 7. Phases
+
+### Phase 0: Restore, probe, download (≈10 min)
+- Restore state and tools, re-probe the machine, run Gate 0.
+- Background download (resumable, `nohup`, logged) of the author's file: ISTA-DASLab
+  `Qwen3.8-Flash-Next-GSQ-RCO` **IQ2_XS** (two shards, ~64 GB; pass `-00001-of-00002`). Confirm repo
+  and file names from the HF API first.
+- Also download the tiny smoke file (e.g. Qwen3.5-2B Q4_K_M).
+
+### Phase 1: Build with Turing patches and pass the kernel tests (≈45–60 min)
+1. **Toolchain:** `rustup` stable (edition 2024).
+   - **NVRTC 13:** use Kaggle's CUDA 13 toolkit `libnvrtc.so.13` if present, else
+     `pip install nvidia-cuda-nvrtc==13.*`. Put its lib directory on `LD_LIBRARY_PATH`.
+   - **Driver:** if there's no CUDA stub, point to `/usr/local/nvidia/lib64/libcuda.so`.
+2. Clone and check out `37ba980` (or newer: if newer, re-run `nvrtc_check.py` for sm_75 first, and
+   re-apply or adapt the patch).
+3. Apply the patch: `git apply $OUT/patches/kernels-sm75.diff`. Check it with
+   `python3 nvrtc_check.py src/cuda/kernels.cu sm_75` (it must say rc=0 for both KV_Q8 values).
+4. **Write the host patches** (`patches/host-sm75.diff`):
+   - **H1:** in `Gpu::new`, read `CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN` and set
+     `min(96 << 10, optin)`.
+   - **H2:** store the compute capability in `Gpu`. In `attn_prefill`, use
+     `bk = if sm < 80 { 16 } else { 32 }` and `smem = 2 * (64 + 2 * bk) * (hd + 8)`.
+   - Optional guard for H3: if sm < 80 and the KV cache is f16 with hd ≥ 256, fail with a clear
+     message saying "use --kv q8".
+5. `cargo build --release -j4`. If the build or the first run fails on missing CUDA 13.1 driver
+   symbols, change cudarc's feature `cuda-13010` → `cuda-13000` in `Cargo.toml`, rebuild, and record
+   the change.
+6. **Run the GPU kernel tests on the T4** (the decisive check for T1–T5):
+   ```
+   CUDA_VISIBLE_DEVICES=0 cargo test --release --test kernels -- --test-threads=1
+   CUDA_VISIBLE_DEVICES=0 cargo test --release --test kv_q8 --test gpu_model --test backend -- --test-threads=1
+   ```
+   Tests that need `/mnt/ollama/...` model paths skip themselves when the file is missing. Symlink
+   the downloaded IQ2_XS shards to `/mnt/ollama/qwen4exp/` so `qwen4exp_gpu_matches_cpu`,
+   `qwen4exp_greedy_paris` and `qwen4exp_config` also run.
+   - **Gate 1:** every kernel test passes (especially the gemm, gemmi and attn_prefill ones), and
+     `qwen4exp_gpu_matches_cpu` passes.
+   - If an mma test fails, the fragment mapping in T3/T4 is wrong. Fix it against the PTX ISA
+     fragment tables (time box 45 min). Failing that, route around it: prefill with `--chunk 0`
+     (token by token, so no gemm/gemmi/attn_prefill; slow prefill, but decode is unaffected). Record
+     this.
+7. With no model running, archive the binary and cubin cache to `bin/`; save both diffs to
+   `patches/`; sync.
+
+### Phase 2: Smoke and first Flash-Next run on GPU 0 (≈30 min)
+1. 2B smoke: `$RS generate --model <2B> --prompt "The capital of France is" -n 32 --gpu --kv q8 --vram-margin 256`.
+   The output must be sensible.
+2. Flash-Next IQ2_XS, GPU 0, `--gpu --kv q8 --vram-margin 256 --ctx 16384`, greedy, under the guard.
+   Run `generate` with the README prompt (second run counts), then `bench --pp 512,4096 --tg 128 --reps 3`.
+   Record the hit rate, misses, cache swaps and CPU worker busy time from stderr.
+3. **Adaptation:** generate 1,500 tokens on a coding prompt, re-run bench, and confirm the profile
+   file was written and is used on restart.
+- **Gate 2:** correct output, no guard kill. Record `R1_single_baseline`.
+
+### Phase 3: Tune one T4, and measure what decides Phase 5 (≈45 min)
+One variable at a time; bench with `--reps 3`.
+1. `strata calibrate --model … --kv q8 --vram-margin 256` (prefill chunk, MTP drafts, short-prompt
+   threshold). Then try overrides.
+2. `--threads` 2, 3, 4. There are only 4 logical cores, and the worker thread spins.
+3. `--vram-margin` 256 / 192 / 128.
+4. `--mtp` 0 / 1 / 2 (record acceptance; greedy only).
+5. `--chunk` from calibrate vs 1024 vs 512 (VRAM taken from experts vs prefill speed).
+6. Context: bench `--pp 4096,16384` (and 32768 if RAM allows).
+- **Decision data for Phase 5:** at the best config, record the hit rate, CPU worker busy time per
+  token, total time per token, and GPU 0 util.
+  - If the CPU worker is busy for **> 40%** of each token, the second-GPU tier should pay off; go to
+    Phase 4 then 5.
+  - If it is < 20% (GPU 0-bound), Phase 5 gains little: do Phase 4 only.
+
+### Phase 4: Two independent instances, zero code (≈25 min)
+- Instance A on `--device 0`, instance B on `--device 1`. Use separate `XDG_CACHE_HOME` directories
+  (profiles and cubin caches), the same GGUF (page cache shared), and lower `--threads` (e.g. 2 each).
+- Measure each one alone, then two concurrent requests (aggregate and per-request tok/s), plus peak
+  non-reclaimable RAM.
+- Record `R1_two_instances`. That gives llama-swap two single-user backends.
+
+### Phase 5: Build the GPU 1 expert tier (≈2–3 h; skip if the Phase 3 rule says so)
+Build §6 in small steps, committing to a local branch and saving the diff to
+`patches/expert-gpu.diff` after each step:
+1. A second backend plus a static GPU 1 cache (no adaptation), behind `--expert-gpu 1`. Run the
+   correctness gates.
+2. Measure the hit rate across both tiers and decode tok/s.
+3. Add three-tier adaptation. Re-measure after 1,500 tokens.
+4. Re-tune `--threads` and the margins of both GPUs.
+- **Gate 5:** correctness gates pass, and decode ≥ 1.4× the Phase 3 best. Otherwise keep the code
+  as a diff, record the result, and fall back to Phase 4.
+
+### Phase 6: Prefill on GPU 1 (≈1–1.5 h; optional)
+Only if Phase 5 passed **and** the 16K-prompt TTFT is > 30 s. Build the §6 prefill path, run the same
+correctness gates, and measure 4K and 16K prefill.
+
+### Phase 7: Quant ladder on the best configuration (≈40 min, downloads overlapped)
+- **Q2_0** (or the Coder **IQ1_M**, whichever is smaller): more of the model resident, so faster.
+- **IQ3_XXS:** only if the best configuration is ≥ 15 tok/s and RAM headroom is ≥ 4 GiB.
+- **Quality:** `strata perplexity --file <wikitext-2 test> --chunks 20 --ctx-len 512` per quant;
+  top-1 agreement via `strata score` against IQ3_XXS (if it runs) on 20 fixed prompts.
+
+### Phase 8: Capability and agentic checks on the winner (≈45 min)
+1. **Code:** ≥ 30 executed Python tasks, pass@1.
+2. **Tool calls:** ≥ 20 through `/v1/chat/completions` with `tools`. Confirm `chat.rs` renders
+   Flash-Next's template; record parse failures.
+3. **IFEval-style:** ≥ 30. **Math:** ≥ 15.
+4. **Agent replay:** a 5-turn conversation with a 12K-token system prompt plus tools and files, each
+   turn adding ~1K tokens. Record TTFT per turn and
+   `usage.prompt_tokens_details.cached_tokens`. Then send a compacted request (system plus tools
+   kept, history rewritten) to exercise the restart-after-system-prompt path (commit `2a39236`).
+5. **Long context:** needle retrieval at 16K and 32K. **End-to-end:** a 2K prompt + 512-token answer
+   (previous runs: GLM-5.3 47.3 s, Qwen3.6-35B 10.2 s).
+
+### Phase 9: Report (≥ 30 min)
+`REPORT.md` contains:
+- a table of every run (single / two-instance / expert-tier; decode cold and adapted; prefill;
+  TTFT; hit rate per tier; CPU busy %; GPU util; peak RAM; disk MB/token);
+- the Turing patch status, with test results;
+- the second-GPU result against the §2 estimate;
+- the best launch command, a `resume.sh`, and a llama-swap entry (one or two backends);
+- the comparison with the earlier GLM-5.3 (13.3 tok/s) and Qwen3.6-35B (61 tok/s) numbers;
+- licence notes;
+- an "upstreamable" section: the Turing diffs and the expert-GPU diff, each with a one-paragraph
+  description, ready to offer to the author.
+
+Final sync.
+
+---
+
+## 8. Result schema (`results.jsonl`)
+```json
+{"ts":"...","phase":3,"step":"threads_3","commit":"37ba980","patches":["kernels-sm75:<sha>","host-sm75:<sha>"],
+ "mode":"single|two_instances|expert_gpu","gpus":[0],"file":"...IQ2_XS-00001-of-00002.gguf",
+ "params":{"kv":"q8","threads":3,"vram_margin":256,"mtp":1,"chunk":1024,"ctx":16384},
+ "status":"ok|oom_guard|timeout|too_slow|load_error|nvrtc_error|test_fail|wrong_output",
+ "decode_tps":{"first":0,"adapted":0,"after4k":0,"after16k":0},"prefill_tps":{"p4k":0,"p16k":0},
+ "ttft_s":{"p4k":0,"p16k":0},"hit_rate":{"gpu0":0,"gpu1":0},"cpu_busy_pct":0,"swaps":0,
+ "gpu_util_pct":[0,0],"peak_vram_gib":[0,0],"peak_nonreclaim_gib":0,"disk_mb_per_token":0,
+ "mtp_accept":null,"output_sha":"...","notes":""}
+```
+
+## 9. Time budget
+- **Session 1 (≈4.5 h):** Phases 0–4 plus Phase 7's Q2_0 point.
+- **Session 2 (≈4–5 h):** Phase 5, optional Phase 6, Phases 8–9.
+- **If Gate 1 fails irrecoverably:** stop after Phase 1 (~1.5 h) with the diagnosis.
+
+## 10. Failure playbook
+| Symptom | Action |
+|---|---|
+| NVRTC error at start | Re-run `nvrtc_check.py`; the patch didn't apply, or the commit is newer: adapt it |
+| `CUDA_ERROR_INVALID_VALUE` at load | H1 is missing (96 KB shared-memory attribute) |
+| Launch failure in attention prefill | H2 is missing or mismatched with `FA_BK`; or use `--chunk 0` |
+| Launch failure in decode attention | `--kv q8` is missing (H3) |
+| Kernel test mismatch (gemm/gemmi/attn) | Fix the T3/T4 fragment mapping; else use `--chunk 0` |
+| Driver symbol error | cudarc feature `cuda-13000` |
+| Guard RAM kill | Lower `--ctx`/`--chunk`; check that nothing else ran; page cache is fine, anon is not |
+| Two-instance RAM kill | Fewer threads, smaller ctx; else `infeasible (RAM)` |
+| Expert-GPU hang | The worker's timeout must fall back to the CPU; fix before measuring |
+| Self-kill / exit 137 | Nothing heavy alongside; stop by PID only |
